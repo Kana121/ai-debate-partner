@@ -20,6 +20,7 @@ from nltk.tokenize import sent_tokenize
 import openai
 from openai import OpenAI
 import logging
+import tempfile
 
 # Import our fixed settings and services
 from .core.config import settings
@@ -47,13 +48,16 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.client_data: Dict[str, Dict[str, Any]] = {}
         self.recognizer = sr.Recognizer()
+        # Configure the recognizer to be less sensitive to ambient noise
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 0.8  # seconds of non-speaking audio before a phrase is considered complete
 
     async def connect(self, client_id: str, websocket: WebSocket):
         await websocket.accept()
         self.active_connections[client_id] = websocket
         self.client_data[client_id] = {
+            "connected_at": datetime.utcnow(),
             "transcript": "",
-            "last_activity": datetime.utcnow(),
             "audio_chunks": []
         }
         logger.info(f"Client {client_id} connected")
@@ -90,13 +94,89 @@ async def debate_websocket(websocket: WebSocket, session_id: str):
                 message_type = message.get("type")
                 
                 if message_type == "audio_chunk":
-                    # Process audio chunk
-                    audio_data = base64.b64decode(message["data"].split(",")[1])
-                    audio_duration = message.get("duration_seconds")  # Duration of the audio chunk in seconds
-                    
-                    # For now, we'll just log that we received audio
-                    # In a real implementation, we would process the audio here
-                    logger.debug(f"Received audio chunk of {len(audio_data)} bytes")
+                    try:
+                        # Process audio chunk
+                        audio_data = base64.b64decode(message["data"].split(",")[1])
+                        audio_duration = message.get("duration_seconds", 0)
+                        
+                        # Save audio data to a temporary file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
+                            temp_audio_file.write(audio_data)
+                            temp_audio_path = temp_audio_file.name
+                        
+                        try:
+                            # Process the audio file with speech recognition
+                            with sr.AudioFile(temp_audio_path) as source:
+                                audio = manager.recognizer.record(source)
+                                text = manager.recognizer.recognize_google(audio)
+                                
+                                # Initialize transcript in client data if not exists
+                                if "transcript" not in manager.client_data[session_id]:
+                                    manager.client_data[session_id]["transcript"] = ""
+                                
+                                # Update transcript
+                                manager.client_data[session_id]["transcript"] += " " + text
+                                
+                                # Initialize AI analyzer
+                                analyzer = AIAnalyzer()
+                                
+                                # Analyze the speech
+                                analysis = await analyzer.analyze_speech(
+                                    text=text,
+                                    audio_duration=audio_duration
+                                )
+                                
+                                # Prepare response
+                                response = {
+                                    "type": "analysis_update",
+                                    "timestamp": datetime.utcnow().isoformat(),
+                                    "transcript": text,
+                                    "full_transcript": manager.client_data[session_id]["transcript"],
+                                    "metrics": analysis.get("metrics", {}),
+                                    "feedback": analysis.get("feedback", {})
+                                }
+                                
+                                # Send the response back to client
+                                await websocket.send_json(response)
+                                
+                        except sr.UnknownValueError:
+                            logger.warning("Speech Recognition could not understand audio")
+                            await websocket.send_json({
+                                "type": "warning",
+                                "message": "Could not understand audio. Please speak clearly.",
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                        except sr.RequestError as e:
+                            logger.error(f"Speech recognition error: {e}")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Speech recognition service error. Please try again.",
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                        except Exception as e:
+                            logger.error(f"Error in speech recognition: {str(e)}")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Error processing speech: {str(e)}",
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                        finally:
+                            # Clean up the temporary files
+                            try:
+                                if 'webm_path' in locals() and os.path.exists(webm_path):
+                                    os.unlink(webm_path)
+                                if 'wav_path' in locals() and os.path.exists(wav_path):
+                                    os.unlink(wav_path)
+                            except Exception as e:
+                                logger.error(f"Error deleting temp files: {e}")
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing audio chunk: {e}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Error processing audio: {str(e)}",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                     
                 elif message_type == "transcript":
                     # Process transcript
